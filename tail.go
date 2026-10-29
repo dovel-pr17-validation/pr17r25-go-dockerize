@@ -1,0 +1,77 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"time"
+
+	"github.com/hpcloud/tail"
+)
+
+func tailFile(ctx context.Context, file string, poll bool, dest io.Writer) {
+	defer wg.Done()
+
+	var isPipe bool
+	var errCount int
+
+	s, err := os.Stat(file)
+	if err != nil {
+		log.Printf("Warning: unable to stat %s: %s", file, err)
+		errCount++
+		isPipe = false
+	} else {
+		isPipe = s.Mode()&os.ModeNamedPipe != 0
+	}
+
+	t, err := tail.TailFile(file, tail.Config{
+		Follow: true,
+		ReOpen: true,
+		Poll:   poll,
+		Logger: tail.DiscardingLogger,
+		Pipe:   isPipe,
+	})
+	if err != nil {
+		log.Fatalf("unable to tail %s: %s", file, err)
+	}
+
+	defer func() {
+		if err := t.Stop(); err != nil {
+			log.Printf("Warning: unable to stop tailing %s: %s", file, err)
+		}
+		t.Cleanup()
+	}()
+
+	// main loop
+	for {
+		select {
+		// if the channel is done, then exit the loop
+		case <-ctx.Done():
+			return
+		// get the next log line and echo it out
+		case line := <-t.Lines:
+			if line == nil {
+				// Check if there's an actual error
+				if err := t.Err(); err != nil {
+					log.Printf("Warning: unable to tail %s: %s", file, err)
+					errCount++
+					if errCount > 30 {
+						log.Fatalf("Logged %d consecutive errors while tailing. Exiting", errCount)
+					}
+					time.Sleep(2 * time.Second) // Sleep for 2 seconds before retrying
+					continue
+				}
+				return
+			} else {
+				if _, err := fmt.Fprintln(dest, line.Text); err != nil {
+					// a broken destination won't recover, so stop tailing this file
+					log.Printf("unable to write tailed line from %s: %s", file, err)
+					return
+				}
+				errCount = 0 // Zero the error count
+			}
+		}
+	}
+}
